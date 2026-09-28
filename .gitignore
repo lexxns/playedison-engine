@@ -1,0 +1,6 @@
+# Build products — build.sh regenerates all of these.
+duel_runner_edo
+*.o
+*.a
+edo-core/build_wrap/
+lua54/liblua_cpp.a
