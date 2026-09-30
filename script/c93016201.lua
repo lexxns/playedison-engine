@@ -76,11 +76,16 @@ function c93016201.activate1(e,tp,eg,ep,ev,re,r,rp)
 	if not c:IsRelateToEffect(e) then return end
 	-- [compat] era CHAININFO_CHAIN_COUNT removed in modern core; chain count is Duel.GetCurrentChain()
 	local ct=Duel.GetCurrentChain()
-	local tg=Duel.GetChainInfo(0,CHAININFO_TARGET_CARDS)
-	local tc=tg:GetFirst(tg)
+	-- [compat] CHAININFO_TARGET_CARDS is not populated for this link either — the
+	-- card being negated is recorded as *operation info* (see target1), not as a
+	-- target card — so `tg` was nil, `tg:GetFirst` raised before the negate, and
+	-- the 800 paid in cost1 bought nothing: the negated card resolved anyway.
+	-- Take the card from the chain link itself, exactly as target1 does.
+	local pe=Duel.GetChainInfo(ct-1,CHAININFO_TRIGGERING_EFFECT)
+	local tc=pe and pe:GetHandler() or nil
 	Duel.NegateEffect(ct-1)
-	local loc=tc:GetLocation()
-	if tc:IsRelateToEffect(e) and loc~=LOCATION_DECK then
+	local loc=tc and tc:GetLocation() or LOCATION_DECK
+	if tc and tc:IsRelateToEffect(e) and loc~=LOCATION_DECK then
 		Duel.Destroy(tc,REASON_EFFECT)
 	end
 end
