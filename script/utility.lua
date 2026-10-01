@@ -3077,6 +3077,14 @@ end
 -- STORING a counter (card::add_counter masks ~COUNTER_NEED_ENABLE) but the
 -- read/remove lookups do not, so era scripts must strip it too or they never
 -- find the counters they placed. Mask here so the era scripts keep their types.
+--
+-- This covers the *runtime* calls below only.  A counter type that goes into an
+-- effect **code** has to be masked where it is registered, because the core looks
+-- those up with whatever type the runtime call passed: Magical Citadel's
+-- `EFFECT_RCOUNTER_REPLACE+0x3001` was registered under 0x33001 while every
+-- lookup asked for 0x31001, so its "remove the counters from me instead" effect
+-- was invisible and a charged Citadel could not pay Royal Magical Library's cost.
+-- See .smoke/magical_citadel_test.py.
 local function _mask_ct(t) return (t & 0xffff) & ~0x2000 end
 do
 	local _orig = Card.GetCounter

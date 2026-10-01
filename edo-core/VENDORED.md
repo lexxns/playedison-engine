@@ -23,8 +23,10 @@ with it, which is why both files are committed here.
 
 ## Local patches
 
-`libduel.cpp` is the only file that differs from the pinned commit. It adds the
-four era activity checks the modern core dropped — `Duel.CheckSummonActivity`,
+Three files differ from upstream. Any re-vendor has to re-apply all three.
+
+**`libduel.cpp`** adds the four era activity checks the modern core dropped —
+`Duel.CheckSummonActivity`,
 `Duel.CheckFlipSummonActivity`, `Duel.CheckSpecialSummonActivity` and
 `Duel.CheckAttackActivity` — right next to upstream's
 `CheckNormalSummonActivity`. The 2011 scripts gate "you cannot Summon other
@@ -36,13 +38,35 @@ Lord) were silently unactivatable. Each one reads the per-turn state counter
 `Duel.GetActivityCount` reports (`summon_state_count`, `flipsummon_state_count`,
 `spsummon_state_count`, `attack_state_count`) and returns "already spent".
 
-The `rsync` update below copies straight over the sources, so re-apply the patch
-and check both guards:
+**`processor.cpp`** passes the triggering effect's own description to
+`Processors::SelectEffectYesNo` in `SelectChain` (both the SEGOC path and the
+single-optional-trigger path) instead of the generic `0`/`221`, so the client can
+name *which* effect is being offered rather than showing a bare Yes/No.
+
+**`operations.cpp`** consumes the Deck-shuffle request inside
+`Processors::SendTo`, right after the move, instead of leaving it to the
+cost/target/operation processors' end-blocks. `add_card` raises
+`shuffle_deck_check` for `SEQ_DECKSHUFFLE` ("into the Deck and shuffle it") and
+`remove_card` raises it for a card leaving the Deck, but `Duel.SendtoDeck`
+suspends the Lua coroutine while a `Processors::SendTo` performs the move — so by
+the time the flag is raised the operation's end-block has already run, the next
+processor's start cleared the flag without shuffling, and the Deck kept the exact
+order it had. The card was put back **on top**: `Duel.SendtoDeck(c,nil,2,…)` is how
+Ehren, Lightsworn Monk, the Gladiator Beasts, Trap Dustshoot and 30-odd other era
+scripts return a card to the Deck, so a monster could simply be re-drawn. 34 of
+the 37 scripts that pass `2` rely on it alone (Moray of Greed and Pot of Avarice
+also call `Duel.ShuffleDeck`, which is why they were never affected); every one of
+them means "return it to the Deck", which shuffles by rule, and none means "put it
+on top" — that is sequence 0. `.smoke/deck_shuffle_test.py` pins it.
+
+The `rsync` update below copies straight over the sources, so re-apply the patches
+and check the guards:
 
 ```bash
 diff <(git --git-dir=.edo-core-upstream show <sha>:libduel.cpp) sim/edo-core/libduel.cpp
 ../venv/bin/python3 ../.smoke/activity_check_test.py    # the behaviour
 ../venv/bin/python3 ../.smoke/script_api_test.py        # no script calls a name the core lacks
+../venv/bin/python3 ../.smoke/deck_shuffle_test.py      # a card returned to the Deck shuffles it
 ```
 
 ## Updating

@@ -17,7 +17,15 @@ function c39910367.initial_effect(c)
 	local e4=Effect.CreateEffect(c)
 	e4:SetDescription(aux.Stringid(39910367,0))
 	e4:SetType(EFFECT_TYPE_CONTINUOUS+EFFECT_TYPE_FIELD)
-	e4:SetCode(EFFECT_RCOUNTER_REPLACE+0x3001)
+	-- [compat] the effect *code* has to carry the same counter id the core looks up.
+	-- utility.lua masks the era counter types for every runtime call
+	-- (`Card.IsCanRemoveCounter` etc.: 0x3001 -> 0x1001, stripping the
+	-- COUNTER_NEED_ENABLE bit the modern core drops when it stores a counter), so
+	-- a lookup arrives as EFFECT_RCOUNTER_REPLACE+0x1001.  Registering the raw era
+	-- value (0x3001) put the effect under a code nothing ever asked for, which is
+	-- why "remove Spell Counters from Magical Citadel instead" was never offered —
+	-- a player with a charged Citadel could not pay Royal Magical Library's cost.
+	e4:SetCode(EFFECT_RCOUNTER_REPLACE+0x1001)
 	e4:SetRange(LOCATION_SZONE)
 	e4:SetCountLimit(1)
 	e4:SetCondition(c39910367.rcon)

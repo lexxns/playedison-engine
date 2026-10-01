@@ -4506,6 +4506,25 @@ bool field::process(Processors::SendTo& arg) {
 			pcard->current.position = pcard->sendto_param.position;
 			message->write(pcard->get_info_location());
 			message->write<uint32_t>(pcard->current.reason);
+			// `move_card` -> `add_card`/`remove_card` has just raised the
+			// Deck-shuffle request (SEQ_DECKSHUFFLE, "into the Deck and shuffle it",
+			// or simply a card leaving the Deck) — consume it here.
+			//
+			// Consuming it at the end of the cost/target/operation processor, which
+			// is what the processor.cpp blocks do, is too early for this path:
+			// `Duel.SendtoDeck` suspends the Lua coroutine, so the operation's
+			// end-block has already run by the time this processor performs the
+			// move.  The request was therefore left set, the next processor's start
+			// cleared it without shuffling, and the Deck kept the exact order it
+			// had: `Duel.SendtoDeck(c,nil,2,...)` is how Ehren, Lightsworn Monk,
+			// the Gladiator Beasts, Trap Dustshoot and 30-odd other era scripts put
+			// a card back, so a returned card would simply be drawn again.
+			if(!core.shuffle_check_disabled) {
+				if(core.shuffle_deck_check[0])
+					shuffle(0, LOCATION_DECK);
+				if(core.shuffle_deck_check[1])
+					shuffle(1, LOCATION_DECK);
+			}
 		}
 		if(pcard->current.location == LOCATION_DECK && (core.deck_reversed || (pcard->current.position == POS_FACEUP_DEFENSE)))
 			param->check_decktop_visibility[control_player] = true;

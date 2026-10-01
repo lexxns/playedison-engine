@@ -1766,7 +1766,14 @@ static bool skip_message(const uint8_t type, Msg& m) {
     case MSG_HINT: case MSG_PLAYER_HINT: m.u8(); m.u8(); m.u64(); return true;   // hint: type,player,data; player_hint: player,type,data
     case MSG_CONFIRM_DECKTOP: case MSG_CONFIRM_EXTRATOP: { m.u8(); int c = static_cast<int>(m.u32()); m.skip(4 * c); return true; }
     case MSG_CONFIRM_CARDS: { m.u8(); int c = static_cast<int>(m.u32()); m.skip(10 * c); return true; }
-    case MSG_SHUFFLE_DECK: case MSG_SWAP_GRAVE_DECK: m.u8(); return true;
+    case MSG_SHUFFLE_DECK: {
+        const int p = m.u8();
+        // Under --trace, say that a Deck was shuffled.
+        if (g_trace)
+            std::fprintf(stderr, "[trace] shuffle deck p%d\n", p);
+        return true;
+    }
+    case MSG_SWAP_GRAVE_DECK: m.u8(); return true;
     case MSG_SHUFFLE_HAND: case MSG_SHUFFLE_EXTRA: { m.u8(); int c = static_cast<int>(m.u32()); m.skip(4 * c); return true; }
     case MSG_SHUFFLE_SET_CARD: { m.u8(); int c = static_cast<int>(m.u32()); m.skip(6 * c); return true; }
     case MSG_DECK_TOP: m.skip(1 + 4 + 4 + 4); return true;          // player, count(0), code, position
