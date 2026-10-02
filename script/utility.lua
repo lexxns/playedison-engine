@@ -3242,6 +3242,13 @@ end
 
 -- era-typo globals used inside card scripts (fixed here so those scripts
 -- behave as intended instead of erroring at runtime)
+--
+-- Lua 5.2 moved the global `unpack` to `table.unpack`.  19 era scripts still
+-- call the global (mostly to build an AnnounceNumber list); without this shim
+-- each one dies with "attempt to call a nil value (global 'unpack')" the moment
+-- its operation runs — Wall of Revealing Light (c17078030) did it inside
+-- `initial_effect`, so the card was inert from the first turn.
+_G.unpack = _G.unpack or table.unpack
 _G.LOCAITON_GRAVE  = LOCATION_GRAVE
 _G.LOCAITON_MZONE  = LOCATION_MZONE
 _G.LOCATION_MOZNE  = LOCATION_MZONE
