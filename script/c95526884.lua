@@ -24,9 +24,15 @@ function c95526884.reccon(e,tp,eg,ep,ev,re,r,rp)
 	local c=e:GetHandler()
 	local a=Duel.GetAttacker()
 	local d=Duel.GetAttackTarget()
-	local m=a:GetAttack()-d:GetDefence()
+	-- a direct attack has no target, so `d` is nil: indexing it raised
+	-- "attempt to index a nil value (local 'd')" at the end of the Damage Step
+	if not d then return false end
+	-- the attacked monster may have been destroyed by this battle, in which case
+	-- its DEF is read from its last moment on the field
+	local def=d:IsLocation(LOCATION_MZONE) and d:GetDefence() or d:GetPreviousDefenseOnField()
+	local m=a:GetAttack()-def
 	e:SetLabel(m)
-	return c==a and m>0 and bit.band(d:GetBattlePosition(),POS_DEFENCE)~=0
+	return c==a and def>=0 and m>0 and bit.band(d:GetBattlePosition(),POS_DEFENCE)~=0
 end
 function c95526884.rectg(e,tp,eg,ep,ev,re,r,rp,chk)
 	if chk==0 then return true end

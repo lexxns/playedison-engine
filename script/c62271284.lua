@@ -12,7 +12,10 @@ function c62271284.initial_effect(c)
 end
 function c62271284.condition(e,tp,eg,ep,ev,re,r,rp)
 	local at=Duel.GetAttackTarget()
-	return tp~=Duel.GetTurnPlayer() and at:IsFaceup() and at:IsType(TYPE_NORMAL)
+	-- a direct attack has no target, so `at` is nil: indexing it used to raise
+	-- "attempt to index a nil value (local 'at')" whenever this was Set and the
+	-- opponent attacked with an empty field
+	return tp~=Duel.GetTurnPlayer() and at and at:IsFaceup() and at:IsType(TYPE_NORMAL)
 end
 function c62271284.filter(c)
 	return not (c:IsFaceup() and c:IsType(TYPE_NORMAL) and c:IsAttack()) and c:IsDestructable()

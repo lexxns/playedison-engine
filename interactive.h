@@ -953,14 +953,14 @@ static std::string card_opt_json(const uint32_t code, const uint32_t pos = 0) {
 
 // human-readable zone name for a card option (so deck/field/hand targets can
 // be told apart in the button list)
-static const char *loc_name(const uint8_t loc) {
+static std::string loc_name(const uint8_t loc, const uint8_t ctrl, const uint8_t viewer) {
     switch (loc) {
         case 0x01: return "Deck";
         case 0x02: return "Hand";
         case 0x04: return "Field";
         case 0x08: return "Spell/Trap";
-        case 0x10: return "Graveyard";
-        case 0x20: return "Banished";
+        case 0x10: return (ctrl == viewer) ? "Graveyard" : "Opponent's Graveyard";
+        case 0x20: return (ctrl == viewer) ? "Banished" : "Opponent's Banished";
         case 0x40: return "Extra Deck";
         case 0x80: return "Overlay";
         default: return "";
@@ -982,7 +982,7 @@ static std::string card_opt_json_secret(const uint32_t code, const uint32_t pos,
             << ",\"pos\":" << pos
             << ",\"p\":" << static_cast<int>(ctrl)
             << ",\"loc\":" << static_cast<int>(loc)
-            << ",\"locname\":" << json::str(loc_name(loc))
+            << ",\"locname\":" << json::str(loc_name(loc, ctrl, viewer))
             << ",\"seq\":" << seq
             << ",\"hidden\":" << (hidden ? "true" : "false") << "}";
     return out.str();
@@ -993,7 +993,8 @@ static std::string card_opt_json_secret(const uint32_t code, const uint32_t pos,
 // 1-based) and where the card is.  effect==0 means the script set no
 // description, so the UI should not label it "effect N".
 static std::string effect_opt_json(const uint32_t code, const uint8_t ctrl, const uint8_t loc,
-                                   const uint32_t seq, const uint64_t desc, const bool is_trigger = false) {
+                                   const uint32_t seq, const uint64_t desc, const uint8_t viewer,
+                                   const bool is_trigger = false) {
     const uint32_t effect = (desc && desc > 0x7ff) ? static_cast<uint32_t>((desc & 0xfffff) + 1) : 0;
     const std::string dtext = card_desc_string(desc);
     // no card description: fall back to naming the trigger window so the player
@@ -1004,7 +1005,7 @@ static std::string effect_opt_json(const uint32_t code, const uint8_t ctrl, cons
             << ",\"name\":" << json::str(card_name_ui(code))
             << ",\"p\":" << static_cast<int>(ctrl)
             << ",\"loc\":" << static_cast<int>(loc)
-            << ",\"locname\":" << json::str(loc_name(loc))
+            << ",\"locname\":" << json::str(loc_name(loc, ctrl, viewer))
             << ",\"seq\":" << seq
             << ",\"effect\":" << effect
             // `trig` is the engine's own EFFECT_TYPE_TRIGGER_* flag: a "when ..."
@@ -1597,7 +1598,7 @@ static bool human_effectyn(const intptr_t duel_handle, Msg &msg) {
     emit_state();
     std::ostringstream out;
     out << R"({"ev":"prompt","type":"effectyn","player":)" << static_cast<int>(g_active_prompt_player) << ",\"card\":"
-            << effect_opt_json(code, ctrl, loc, seq, desc) << "}";
+            << effect_opt_json(code, ctrl, loc, seq, desc, g_active_prompt_player) << "}";
     emit_line(out.str());
     const std::string line = read_action_line();
     const actjson::Val value = actjson::field(line, "value");
@@ -1740,7 +1741,7 @@ static bool human_sum(intptr_t duel_handle, Msg &msg) {
         std::ostringstream out;
         out << "{\"code\":" << code << ",\"name\":" << json::str(card_name_ui(code))
                 << ",\"p\":" << static_cast<int>(ctrl) << ",\"loc\":" << static_cast<int>(loc)
-                << ",\"locname\":" << json::str(loc_name(loc))
+                << ",\"locname\":" << json::str(loc_name(loc, ctrl, g_active_prompt_player))
                 << ",\"seq\":" << seq << ",\"level\":" << lv << "}";
         opts[i] = out.str();
     }
@@ -1786,7 +1787,7 @@ static bool human_chain(const intptr_t duel_handle, Msg &msg) {
         const uint64_t desc = msg.u64();
         msg.u8();                       // client_mode
         const uint8_t trig = msg.u8();  // effect type: optional/mandatory trigger
-        opts[i] = effect_opt_json(code, ctrl, loc, seq, desc, trig != 0);
+        opts[i] = effect_opt_json(code, ctrl, loc, seq, desc, g_active_prompt_player, trig != 0);
     }
     emit_state();
     std::ostringstream out;
@@ -1945,7 +1946,7 @@ static bool human_idlecmd(intptr_t duel_handle, Msg &msg) {
         uint32_t seq = msg.u32();
         uint64_t desc = msg.u64();
         msg.u8();
-        act_opts[i] = effect_opt_json(code, ctrl, loc, seq, desc);
+        act_opts[i] = effect_opt_json(code, ctrl, loc, seq, desc, g_active_prompt_player);
     }
     int to_bp = msg.u8(), to_ep = msg.u8(), can_shuffle = msg.u8();
     emit_state();
@@ -2020,7 +2021,7 @@ static bool human_battlecmd(intptr_t duel_handle, Msg &msg) {
         uint32_t seq = msg.u32();
         uint64_t desc = msg.u64();
         msg.u8();
-        act_opts[i] = effect_opt_json(code, ctrl, loc, seq, desc);
+        act_opts[i] = effect_opt_json(code, ctrl, loc, seq, desc, g_active_prompt_player);
     }
     int atk = static_cast<int>(msg.u32());
     std::vector<std::string> atk_opts(atk);
@@ -2293,7 +2294,7 @@ static bool human_select_counter(const intptr_t duel_handle, Msg &msg) {
             << ",\"name\":" << json::str(card_name_ui(cards[i].code))
             << ",\"p\":" << static_cast<int>(cards[i].ctrl)
             << ",\"loc\":" << static_cast<int>(cards[i].loc)
-            << ",\"locname\":" << json::str(loc_name(cards[i].loc))
+            << ",\"locname\":" << json::str(loc_name(cards[i].loc, cards[i].ctrl, g_active_prompt_player))
             << ",\"seq\":" << static_cast<int>(cards[i].seq)
             << ",\"held\":" << cards[i].held << "}";
     }
