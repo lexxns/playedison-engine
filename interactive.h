@@ -1146,6 +1146,18 @@ static void anim_game_event(uint8_t type, Msg &msg) {
                     << ",\"name\":" << json::str(card_name_ui(card_code))
                     << ",\"turn\":" << g_turns << "}";
             emit_line(out.str());
+            // the analytics record: a summon / Special Summon / Flip Summon is a
+            // card "used", recorded as data instead of parsed back out of the log
+            // text.  loc/seq/pos are already public in the anim hint above.
+            std::ostringstream us;
+            us << R"({"ev":"use","kind":")" << kind << "\""
+                    << ",\"p\":" << static_cast<int>(controller)
+                    << ",\"loc\":" << static_cast<int>(location)
+                    << ",\"seq\":" << sequence
+                    << ",\"code\":" << card_code
+                    << ",\"pos\":" << position
+                    << ",\"turn\":" << g_turns << "}";
+            emit_line(us.str());
             if (type == MSG_FLIPSUMMONING) {
                 // a Flip Summon is a face-down DEF monster turning face-up in
                 // Attack Position: flip the card over and straighten it at once
@@ -1313,6 +1325,19 @@ static void anim_game_event(uint8_t type, Msg &msg) {
             return;
         }
         case MSG_SET: {
+            // payload: [code u32][ctrl u8][loc u8][seq u32][pos u32]
+            uint32_t code = msg.u32();
+            uint8_t ctrl = msg.u8();
+            // loc/seq describe the hidden hand/field position of a face-down
+            // card: they are deliberately NOT emitted (see the `hidden` logic in
+            // zone_json / card_opt_json_secret) — only the controller learns
+            // where the Set landed, and this line is broadcast to both seats.
+            std::ostringstream out;
+            out << R"({"ev":"use","kind":"set")"
+                    << ",\"p\":" << static_cast<int>(ctrl)
+                    << ",\"code\":" << code
+                    << ",\"turn\":" << g_turns << "}";
+            emit_line(out.str());
             // a Set is a meaningful action (my monster hit the board face-down)
             note_significant_action();
             return;
