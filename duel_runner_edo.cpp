@@ -350,6 +350,10 @@ static bool opponent_has_known_attack_trap(const uint8_t opp) {
 }
 
 static uint64_t g_last_hint_selectmsg = 0;   // value from last HINT_SELECTMSG
+// Whether that hint belongs to the SELECT now being handed to a player: the
+// interactive handler consumes it once, so a prompt with no hint of its own
+// cannot inherit the previous prompt's question.
+static bool g_hint_selectmsg_fresh = false;
 static uint32_t g_attacker_code = 0;          // attacker we declared in BATTLECMD
 static uint32_t g_attacker_atk = 0;
 static bool g_attack_pending = false;
@@ -1832,8 +1836,10 @@ static void update_field(uint8_t type, Msg& m) {
         uint8_t htype = m.u8();
         uint8_t player = m.u8();
         uint64_t data = m.u64();
-        if (htype == 3)          // HINT_SELECTMSG: remember for SELECT context
+        if (htype == 3) {        // HINT_SELECTMSG: remember for SELECT context
             g_last_hint_selectmsg = data;
+            g_hint_selectmsg_fresh = true;
+        }
         return;
     }
     case MSG_RELOAD_FIELD: {
@@ -2249,6 +2255,14 @@ static bool run_game(const Deck& a, const Deck& b, uint64_t seed, int game_idx,
             uint8_t type = *p;
             if (g_verbose)
                 std::fprintf(stderr, "   msg %d len=%u\n", static_cast<int>(type), mlen);
+            // Chain-prompt context: a pending phase command is only a phase-leave
+            // window until the next real message.  MSG_SELECT_CHAIN (the window
+            // itself), MSG_RETRY (re-asking the same prompt) and MSG_HINT (the
+            // window's own timing hint) keep it; anything else means another
+            // event intervened, so the phase-leave phrasing no longer applies.
+            if (g_interactive && type != MSG_SELECT_CHAIN && type != MSG_RETRY
+                && type != MSG_HINT)
+                clear_phase_command();
             Msg m(p);
             m.u8();
             // keep the field model current with every message (selects included)
@@ -2318,6 +2332,9 @@ static bool run_game(const Deck& a, const Deck& b, uint64_t seed, int game_idx,
                 g_last_prompt.assign(msg_start, msg_end);
                 // forced-move directives take priority over everything
                 if (harness_try_move((intptr_t)duel, type, msg_start, mlen)) {
+                    if (g_interactive
+                        && (type == MSG_SELECT_IDLECMD || type == MSG_SELECT_BATTLECMD))
+                        note_phase_command();
                     responded = true;
                     g_retries = 0;
                     p = msg_end;
@@ -2337,6 +2354,9 @@ static bool run_game(const Deck& a, const Deck& b, uint64_t seed, int game_idx,
                                      g_h_turn, g_h_player, g_h_phase);
                     } else if (harness_auto_respond((intptr_t)duel, type,
                                                     msg_start, mlen)) {
+                        if (g_interactive
+                            && (type == MSG_SELECT_IDLECMD || type == MSG_SELECT_BATTLECMD))
+                            note_phase_command();
                         responded = true;
                         g_retries = 0;
                         p = msg_end;
@@ -2372,9 +2392,19 @@ static bool run_game(const Deck& a, const Deck& b, uint64_t seed, int game_idx,
                     if (handle_select((intptr_t)duel, type, msg_start, static_cast<int>(mlen), rng))
                         done = true;
                 }
+                // the SELECTMSG question belonged to this prompt only; an AI
+                // decision (or a human one) must not leave it fresh for the
+                // next prompt, which may not have a hint of its own
+                g_hint_selectmsg_fresh = false;
                 if (g_ml_out && !g_interactive && !g_assess && !g_h_ff) {
                     ml_pend_resp();
                 }
+                // a phase/battle command was answered (human or AI): a chain
+                // window that arrives before any other message is the turn
+                // player choosing to move on — the phase-leave window
+                if (g_interactive
+                    && (type == MSG_SELECT_IDLECMD || type == MSG_SELECT_BATTLECMD))
+                    note_phase_command();
                 responded = true;
                 g_retries = 0;
                 p = msg_end;
@@ -2411,10 +2441,17 @@ static bool run_game(const Deck& a, const Deck& b, uint64_t seed, int game_idx,
                         if (!human_handled)
                             handle_select((intptr_t)duel, g_last_prompt[0], g_last_prompt.data(),
                                           static_cast<int>(g_last_prompt.size()), rng);
+                        g_hint_selectmsg_fresh = false;
                     }
                     if (g_ml_out && !g_interactive && !g_assess && !g_h_ff)
                         ml_pend_resp();   // keep the pending record on the re-answer
                 }
+                // the re-answer of an idle/battle command is still a phase
+                // command; keep the phase-leave window flag for the next chain
+                if (g_interactive && !g_last_prompt.empty()
+                    && (g_last_prompt[0] == MSG_SELECT_IDLECMD
+                        || g_last_prompt[0] == MSG_SELECT_BATTLECMD))
+                    note_phase_command();
                 p = msg_end;
                 break;
             } else if (type == MSG_WIN) {

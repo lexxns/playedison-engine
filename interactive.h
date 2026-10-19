@@ -88,6 +88,9 @@ extern FieldState g_field;
 extern intptr_t g_duel;
 // The last MSG_HINT(SELECTMSG) payload — tells the UI what a SELECT is about.
 extern uint64_t g_last_hint_selectmsg;
+// true when the last HINT_SELECTMSG belongs to the prompt being built (it is
+// one-shot: a select without its own hint must not inherit a stale question)
+extern bool g_hint_selectmsg_fresh;
 // Pack a card location (controler, location, sequence) into one key: 8 bits of
 // each, which is far more than any zone or hand needs.
 static inline uint32_t loc_key(uint8_t ctrl, uint8_t loc, uint32_t seq) {
@@ -180,6 +183,113 @@ static void clear_significant_action() {
     g_action_reported[1] = false;
 }
 
+// ---------------------------------------------------------------------------
+// Chain-prompt action context ("You activated Pot of Greed" above the
+// "Would you like to chain?" line).
+//
+// The runner records the action that last happened as DATA — who did it, what
+// kind of action, and the card names it needs — and builds the phrase for the
+// prompted seat at prompt time.  Names are captured when the action happens
+// because the card may have left the field (destroyed in the battle) by the
+// time a later window asks its question.
+//
+// `g_last_action` is the phrase source; `g_phase_command_pending` marks the
+// phase-leave window: a chain window that follows an answered idle/battle
+// command with no intervening message means "the turn player chose to move
+// on", which is phrased "You are about to leave the Battle Phase" instead of
+// naming a card.  The duel_runner_edo.cpp message loop sets the flag after
+// answering MSG_SELECT_IDLECMD / MSG_SELECT_BATTLECMD (human and AI paths,
+// including the MSG_RETRY re-answer) and clears it on any message other than
+// MSG_SELECT_CHAIN / MSG_RETRY / MSG_HINT.
+// ---------------------------------------------------------------------------
+struct LastAction {
+    enum Kind {
+        NONE, SUMMON, SET, ACTIVATE, ATTACK, POSITION, PHASE,
+        // Events that can open a window with no player action of their own:
+        // a card moving between locations (sent to the GY, banished, returned
+        // to the Deck, added to the hand, destroyed, Tributed), battle/effect
+        // damage, LP recovery/cost, a draw, a coin toss or a die roll.  These
+        // are what most "when ..." triggers are responding to — e.g. a Set
+        // monster sent to the GY by Armageddon Knight's effect opens a window
+        // that should read "Plaguespreader was sent to the Graveyard", not the
+        // activation that is already resolving.
+        MOVE, DAMAGE, RECOVER, LPCOST, DRAW, COIN, DICE
+    };
+    Kind kind = NONE;
+    uint8_t actor = 0;         // the player who performed the action
+    uint8_t summon_kind = 0;   // SUMMON: 0 = Normal, 1 = Special, 2 = Flip
+    bool set_monster = false;  // SET: monster or Spell/Trap (name stays hidden)
+    std::string card;          // card name, captured when the action happened
+    bool card_public = true;   // may the opponent be told that name?
+    // ATTACK: the attacker is public; the target may be a face-down card.
+    std::string attacker;
+    std::string target;
+    uint8_t target_ctrl = 0;
+    bool target_public = false;
+    bool direct = false;
+    // POSITION: the new position phrase ("attack position", ...).
+    std::string position;
+    // PHASE: the phase that just started.
+    uint32_t phase = 0;
+    // MOVE: where the card came from and went, and why (REASON_* bits).
+    uint8_t from_loc = 0;
+    uint8_t to_loc = 0;
+    uint32_t move_reason = 0;
+    // DAMAGE / RECOVER / LPCOST: the LP amount.  DRAW: how many cards.
+    // COIN / DICE: the results as text.
+    uint32_t amount = 0;
+    int count = 0;
+    std::string results;
+};
+static LastAction g_last_action;
+static bool g_phase_command_pending = false;
+static void note_phase_command() { g_phase_command_pending = true; }
+static void clear_phase_command() { g_phase_command_pending = false; }
+
+// Battle-step track, for the board's Battle-Step/Damage-Step slider.
+// `g_battle` is true from the attack declaration until the game leaves the
+// Battle Phase; `g_battle_step` is 0 (not in the Damage Step) or the Edison
+// substep 1..7.  Both are interactive-only presentation state.
+static bool g_battle = false;
+static int g_battle_step = 0;
+// defined after emit_line(): one empty animation hint per substep transition,
+// so the client can walk the mid-strip bar through the battle while the batch's
+// animations play even when that substep has no animation of its own
+static void emit_battle_step_marker(int step);
+static void set_battle_step(const int step) {
+    if (g_battle_step == step) return;
+    g_battle_step = step;
+    if (g_battle) emit_battle_step_marker(step);
+}
+// PHASE_* bit values that are part of a Battle Phase (0x08..0x80).
+static bool phase_is_battle(const uint32_t ph) {
+    return ph == 0x08 || ph == 0x10 || ph == 0x20 || ph == 0x40 || ph == 0x80;
+}
+
+// Battle context for an animation hint.  The board's mid-strip substep bar is
+// normally driven by snapshots, which arrive only at prompts; a battle with no
+// chainable cards is one batch, so without this the bar would sit still while
+// the attack/flip/damage/destroy animations play and then jump at the end.
+// Tagging each hint with the substep it belongs to lets the client step the bar
+// 0 -> 2 -> 5 -> 6 -> 7 as those animations play.
+static std::string battle_step_json() {
+    std::ostringstream out;
+    if (g_battle)
+        out << ",\"battle\":true,\"step\":" << g_battle_step;
+    return out.str();
+}
+
+// The card whose effect is currently being activated or resolved.  Card scripts
+// ask many questions with no card name in the message ("destroy a card?",
+// "select the card to destroy", a material choice); naming the source is what
+// turns a bare "Yes / No" into "Ryko, Lightsworn Hunter — Destroy a card?".
+// Only public cards are recorded (a card being activated is public).
+static std::string g_effect_source;
+static void note_effect_source(const uint32_t code) {
+    g_effect_source = code ? card_name_ui(code) : "";
+}
+static void clear_effect_source() { g_effect_source.clear(); }
+
 // Reset all per-game state (logs, phase, code cache) for a fresh duel.
 static void log_reset() {
     for (auto & p : g_seat_logs) p.clear();
@@ -189,6 +299,10 @@ static void log_reset() {
     g_just_summoned.clear();
     g_chain_size = 0;
     clear_significant_action();
+    g_last_action = LastAction();
+    clear_phase_command();
+    g_battle = false;
+    g_battle_step = 0;
 }
 
 // Display name of the card at (controller, location, sequence). Tries the AI
@@ -315,6 +429,130 @@ static std::string zone_card_name_for(const uint8_t viewer, const uint8_t loc, c
 static void log_target_line(const std::string &prefix, const uint8_t tl, const uint8_t tc, const uint32_t tseq) {
     for (int v = 0; v < 3; ++v)
         log_add_v(v, prefix + zone_card_name_for(v, tl, tc, tseq));
+}
+
+// "You " / "Your opponent " — the subject of a chain prompt's action phrase.
+static std::string action_actor_prefix(const uint8_t viewer, const uint8_t actor) {
+    return actor == viewer ? "You " : "Your opponent ";
+}
+
+// Is this the card that activated in the current chain?  Used to tell a
+// resolving Spell/Trap's own trip to the Graveyard apart from the card move its
+// effect performed: the latter is the event a follow-up window is asking about,
+// the former is just the card leaving the field after doing its job.
+static bool is_current_chain_card(const uint32_t code, const uint8_t ctrl) {
+    for (const auto &kv: g_chain_links)
+        if (kv.second.code == code && kv.second.ctrl == ctrl) return true;
+    return false;
+}
+
+// How a moved card's destination reads in an action phrase.  Destruction is
+// called out as such rather than as a plain "sent to the Graveyard"; a hidden
+// destination keeps the same wording (the name is what gets hidden).
+static std::string move_verb(const LastAction &a) {
+    switch (a.to_loc) {
+        case 0x10: {  // LOCATION_GRAVE
+            if (a.move_reason & 0x20) return " was destroyed by battle";   // REASON_BATTLE
+            if (a.move_reason & 0x1) return " was destroyed";              // REASON_DESTROY
+            if (a.move_reason & 0x2) return " was Tributed";               // REASON_RELEASE
+            if (a.move_reason & 0x4000) return " was discarded";           // REASON_DISCARD
+            return " was sent to the Graveyard";
+        }
+        case 0x20:  // LOCATION_REMOVED
+            return " was banished";
+        case 0x01:  // LOCATION_DECK
+            return " was returned to the Deck";
+        case 0x02:  // LOCATION_HAND
+            return (a.from_loc & 0x0C) ? " was returned to the hand" : " was added to the hand";
+        case 0x40:  // LOCATION_EXTRA
+            return " was sent to the Extra Deck";
+        default:
+            return " was moved";
+    }
+}
+
+// Build the action_text phrase for seat `viewer` from the recorded action.
+static std::string last_action_text(const uint8_t viewer) {
+    const LastAction &a = g_last_action;
+    switch (a.kind) {
+        case LastAction::SUMMON: {
+            const char *verb = (a.summon_kind == 0) ? "Normal Summoned "
+                               : (a.summon_kind == 1) ? "Special Summoned "
+                                                      : "Flip Summoned ";
+            return action_actor_prefix(viewer, a.actor) + verb + a.card;
+        }
+        case LastAction::SET:
+            // a Set card's name is never revealed (only the card type is public)
+            return action_actor_prefix(viewer, a.actor)
+                   + (a.set_monster ? "set a monster" : "set a Spell/Trap");
+        case LastAction::ACTIVATE:
+            return action_actor_prefix(viewer, a.actor) + "activated " + a.card;
+        case LastAction::ATTACK: {
+            std::string s = action_actor_prefix(viewer, a.actor) + "declared ";
+            if (a.direct) {
+                s += "a direct attack with " + a.attacker;
+            } else {
+                s += "an attack with " + a.attacker + " targeting ";
+                s += (a.target_public || a.target_ctrl == viewer) ? a.target
+                                                                  : std::string("a face-down card");
+            }
+            return s;
+        }
+        case LastAction::POSITION: {
+            const bool visible = a.card_public || a.actor == viewer;
+            return action_actor_prefix(viewer, a.actor) + "changed "
+                   + (visible ? a.card : std::string("a card")) + " to " + a.position;
+        }
+        case LastAction::PHASE:
+            // a phase start is not a player action: it reads as a plain marker
+            return "Start of the " + std::string(phase_name(a.phase));
+        case LastAction::MOVE: {
+            // "Your Plaguespreader was sent to the Graveyard" /
+            // "Your opponent's Mystical Elf was destroyed by battle".
+            // A card that was public (face-up on the field, in a Graveyard, or
+            // in the banished pile) may be named to either seat; a card that
+            // moved out of a hidden zone (Deck, hand, face-down) is named only
+            // to its controller, otherwise it is "a card".
+            const bool mine = (a.actor == viewer);
+            const bool named = a.card_public || mine;
+            std::string owner = mine ? "Your " : "Your opponent's ";
+            if (!named) {
+                // "Your opponent's card ..." reads better than "Your opponent's a card"
+                return (mine ? std::string("Your card")
+                             : std::string("Your opponent's card"))
+                       + move_verb(a);
+            }
+            return owner + a.card + move_verb(a);
+        }
+        case LastAction::DAMAGE:
+            return action_actor_prefix(viewer, a.actor) + "took " + std::to_string(a.amount) + " damage";
+        case LastAction::RECOVER:
+            return action_actor_prefix(viewer, a.actor) + "recovered " + std::to_string(a.amount) + " LP";
+        case LastAction::LPCOST:
+            return action_actor_prefix(viewer, a.actor) + "paid " + std::to_string(a.amount) + " LP";
+        case LastAction::DRAW:
+            return action_actor_prefix(viewer, a.actor) + "drew " + std::to_string(a.count)
+                   + (a.count == 1 ? " card" : " cards");
+        case LastAction::COIN:
+            return action_actor_prefix(viewer, a.actor) + "tossed a coin — " + a.results;
+        case LastAction::DICE:
+            return action_actor_prefix(viewer, a.actor) + "rolled "
+                   + (a.count == 1 ? "a die" : "the dice") + " — " + a.results;
+        default:
+            // Unreachable in practice: NEW_PHASE/NEW_TURN record a PHASE, and
+            // every window that follows a real event records that event.  A
+            // phase marker is still a better answer than "the last action".
+            return "Start of the " + std::string(phase_name(g_current_phase ? g_current_phase : 0x04));
+    }
+}
+
+// The phase-leave window: the turn player answered a phase/battle command and
+// the opponent's chain window came before the phase-change message.
+static std::string phase_leave_text(const uint8_t viewer, const int turn_player,
+                                    const uint32_t phase) {
+    const std::string name = phase_is_battle(phase) ? "Battle Phase" : phase_name(phase);
+    const bool mine = (turn_player == static_cast<int>(viewer));
+    return std::string(mine ? "You are" : "Your opponent is") + " about to leave the " + name;
 }
 
 // ---------------------------------------------------------------------------
@@ -447,6 +685,32 @@ static std::vector<QCard> query_location(const OCG_Duel duel, const uint8_t play
     return out;
 }
 
+// Look up one field card in the CORE's state (not the AI field model).  The
+// Debug/scenario path builds the board from MSG_RELOAD_FIELD, which never
+// populates g_field, so the field model misses cards there; the query API always
+// reflects the real board.  Used to name the attacker/target on an attack.
+static bool query_field_card(const uint8_t ctrl, const uint8_t loc, const uint32_t seq,
+                             uint32_t *code, uint32_t *pos) {
+    for (const auto &qc: query_location(reinterpret_cast<OCG_Duel>(g_duel), ctrl, loc))
+        if (qc.seq == seq) {
+            if (code) *code = qc.code;
+            if (pos) *pos = qc.pos;
+            return true;
+        }
+    return false;
+}
+
+// Name of a field card as the runner's narration sees it, preferring the AI
+// field model (cheap, already loaded) and falling back to the core query.
+static std::string field_card_name(const uint8_t ctrl, const uint8_t loc, const uint32_t seq) {
+    const std::string nm = zone_card_name(loc, ctrl, seq);
+    if (nm != "?") return nm;
+    uint32_t code = 0;
+    if (query_field_card(ctrl, loc, seq, &code, nullptr) && code)
+        return card_name_ui(code);
+    return nm;
+}
+
 static std::string serialize_state_json(const uint8_t viewer) {
     const auto duel = reinterpret_cast<OCG_Duel>(g_duel);
     const uint8_t opp = 1 - viewer;
@@ -539,6 +803,10 @@ static std::string serialize_state_json(const uint8_t viewer) {
             << ",\"turn\":" << g_turns << ",\"steps\":" << g_steps
             << ",\"phase\":" << g_current_phase
             << ",\"phase_name\":" << json::str(phase_name(g_current_phase))
+            // battle-step track: an attack is being resolved, and (when in the
+            // Damage Step) which of the seven Edison substeps we are in
+            << ",\"battle\":" << (g_battle ? "true" : "false")
+            << ",\"battle_step\":" << g_battle_step
             << ",\"lp\":[" << g_field.lp[viewer] << "," << g_field.lp[opp] << "]"
             << ",\"hand0\":" << codes_json(hand0)
             << ",\"hand1_count\":" << opp_hand_q.size()
@@ -601,6 +869,16 @@ static void log_game_event(uint8_t type, Msg &msg) {
                                          ? "special summon"
                                          : "flip summon";
             log_card_event(ctrl, verb, code, /*reveal=*/true);
+            // chain-prompt context: the summoned card is public, so a summon
+            // can be named in the next window's action_text
+            g_last_action = LastAction();
+            g_last_action.kind = LastAction::SUMMON;
+            g_last_action.actor = ctrl;
+            g_last_action.summon_kind = (type == MSG_SUMMONING)
+                                            ? 0
+                                            : (type == MSG_SPSUMMONING) ? 1 : 2;
+            g_last_action.card = card_name_ui(code);
+            g_last_action.card_public = true;
             return;
         }
         case MSG_SET: {
@@ -611,6 +889,13 @@ static void log_game_event(uint8_t type, Msg &msg) {
             msg.u32();
             // face-down: the name is private to the controller
             log_card_event(ctrl, "set", code, /*reveal=*/false, " face-down");
+            // chain-prompt context: only the card TYPE is public (monster vs
+            // Spell/Trap); the name must never leak into the phrase
+            g_last_action = LastAction();
+            g_last_action.kind = LastAction::SET;
+            g_last_action.actor = ctrl;
+            uint32_t tbits = 0;
+            g_last_action.set_monster = card_type_bits(code, tbits) && (tbits & TYPE_MONSTER);
             return;
         }
         case MSG_CHAINING: {
@@ -629,6 +914,25 @@ static void log_game_event(uint8_t type, Msg &msg) {
             const std::string dtext = card_desc_string(desc);
             log_card_event(ctrl, "activate", code, /*reveal=*/true,
                            dtext.empty() ? "" : ": " + dtext);
+            // chain-prompt context: an activation is public and is the
+            // "immediately preceding action" for a chain in response to it
+            g_last_action = LastAction();
+            g_last_action.kind = LastAction::ACTIVATE;
+            g_last_action.actor = ctrl;
+            g_last_action.card = card_name_ui(code);
+            g_last_action.card_public = true;
+            // the card whose effect is about to resolve: non-chain prompts
+            // raised while it resolves (targets, "destroy a card?", materials)
+            // are labelled with it
+            note_effect_source(code);
+            return;
+        }
+        case MSG_CHAIN_SOLVING: {
+            // which chain link is resolving: prompts inside its resolution are
+            // this card's effect asking
+            const uint32_t link = msg.u8();
+            auto it = g_chain_links.find(link);
+            if (it != g_chain_links.end()) note_effect_source(it->second.code);
             return;
         }
         case MSG_ATTACK: {
@@ -640,18 +944,37 @@ static void log_game_event(uint8_t type, Msg &msg) {
             uint8_t tl = msg.u8();
             uint32_t tseq = msg.u32();
             msg.u32();
-            // attacker code is not in MSG_ATTACK; look it up from the field model,
-            // restricted to the attacker's own side (a defender at the same seq on
-            // the opposite side must never be mistaken for the attacker)
-            std::string attacker = "?";
-            for (auto &kv: g_field.zone[ac])
-                if (kv.first.first == al && kv.first.second == aseq) {
-                    attacker = card_name_ui(kv.second.code);
-                    break;
-                }
+            // attacker code is not in MSG_ATTACK; look it up from the field model
+            // (falling back to the core query when the model was not populated,
+            // e.g. in Debug/scenario games), restricted to the attacker's own
+            // side so a defender at the same seq is never mistaken for it
+            std::string attacker = field_card_name(ac, al, aseq);
+            // an attack declaration opens the battle: the step track starts on
+            // Battle Step and starts reporting substeps at MSG_DAMAGE_STEP_START
+            g_battle = true;
+            g_battle_step = 0;
+            g_last_action = LastAction();
+            g_last_action.kind = LastAction::ATTACK;
+            g_last_action.actor = ac;
+            g_last_action.attacker = attacker;
             if (tl == 0) {
+                g_last_action.direct = true;
                 log_action(ac, "declare", " a direct attack with " + attacker);
             } else {
+                // the target may be face-down: capture the real name and its
+                // visibility now, so a later window can still phrase it
+                bool reveal = false;
+                std::string target_real = zone_card_name_secret(tl, tc, tseq, &reveal);
+                if (target_real == "?") {
+                    uint32_t tcode = 0, tpos = 0;
+                    if (query_field_card(tc, tl, tseq, &tcode, &tpos) && tcode) {
+                        target_real = card_name_ui(tcode);
+                        reveal = (tpos & 0x5) != 0;   // face-up attack | defense
+                    }
+                }
+                g_last_action.target = target_real;
+                g_last_action.target_ctrl = tc;
+                g_last_action.target_public = reveal;
                 // the target may be face-down: its name is private to its controller
                 for (int v = 0; v < 3; ++v) {
                     std::string target = zone_card_name_for(v, tl, tc, tseq);
@@ -680,6 +1003,68 @@ static void log_game_event(uint8_t type, Msg &msg) {
                 const char *pos = (cur & 0x1) ? "attack position" : (cur & 0x4) ? "face-up defense" : "face-down";
                 const bool faceup_now = (cur & 0x1) || (cur & 0x4);
                 log_card_event(ctrl, "change", code, faceup_now, std::string(" to ") + pos);
+                // substep 2 (Flip Sets Face-up): the core flips a Set attack
+                // target while still in substep 1, with no window of its own.
+                // That flip is the ENGINE's action, not a player choice: record
+                // the substep but keep the attack declaration as the last action,
+                // so the substep 3/4/6/7 windows still read "declared an attack
+                // with ... targeting ..." instead of blaming the defender for a
+                // position change they did not make.
+                const bool was_down = (prev & 0xA) != 0;   // POS_FACEDOWN_ATTACK|DEFENSE
+                if (g_battle_step == 1 && was_down && faceup_now) {
+                    set_battle_step(2);
+                } else {
+                    // a genuine player/effect position change is the action; the
+                    // new position is public only when the card is face-up after
+                    g_last_action = LastAction();
+                    g_last_action.kind = LastAction::POSITION;
+                    g_last_action.actor = ctrl;
+                    g_last_action.card = card_name_ui(code);
+                    g_last_action.card_public = faceup_now;
+                    g_last_action.position = pos;
+                }
+            }
+            return;
+        }
+        case MSG_MOVE: {
+            // payload: [code u32][prev loc_info][new loc_info][reason u32],
+            // loc_info = [controller u8][location u8][sequence u32][position u32]
+            const uint32_t code = msg.u32();
+            const uint8_t pc = msg.u8();
+            const uint8_t pl = msg.u8();
+            msg.u32();                    // previous sequence
+            const uint32_t ppos = msg.u32();
+            const uint8_t nc = msg.u8();
+            const uint8_t nl = msg.u8();
+            msg.u32();                    // new sequence
+            const uint32_t npos = msg.u32();
+            const uint32_t reason = msg.u32();
+            (void) nc;
+            // Only moves with a destination a trigger can name are context; a
+            // sequence shift inside a zone (pl == nl) is noise.  A card sent to
+            // a Graveyard is public once it lands, as is anything that was
+            // already face-up / in a public pile; a card leaving the hand or
+            // Deck is only named to its controller.
+            const bool interesting = (nl == 0x10 || nl == 0x20 || nl == 0x01
+                                      || nl == 0x02 || nl == 0x40);
+            const bool from_public = (((pl & 0x0C) != 0) && (ppos & 0x5))
+                                     || pl == 0x10 || pl == 0x20;
+            const bool to_public = (nl == 0x10)
+                                   || (nl == 0x20 && (npos & 0x5) != 0);
+            // the activated card's own GY trip after resolving is not what the
+            // next window is responding to (the effect's moves/draws/damage are)
+            const bool self_resolution = (nl == 0x10)
+                                         && !(reason & (0x1 | 0x20 | 0x2 | 0x4000))
+                                         && is_current_chain_card(code, pc);
+            if (interesting && code && !self_resolution) {
+                g_last_action = LastAction();
+                g_last_action.kind = LastAction::MOVE;
+                g_last_action.actor = pc;
+                g_last_action.card = card_name_ui(code);
+                g_last_action.card_public = from_public || to_public;
+                g_last_action.from_loc = pl;
+                g_last_action.to_loc = nl;
+                g_last_action.move_reason = reason;
             }
             return;
         }
@@ -775,13 +1160,25 @@ static void log_game_event(uint8_t type, Msg &msg) {
             }
             log_add("— Damage Calculation —");
             log_action(ac, "battle", ": " + what);
+            // substep 5 (After Damage Calculation): the battle message carries
+            // the calculated ATK/DEF; substep 6 (Resolve Effects) follows as a
+            // HINT_EVENT when the window opens
+            set_battle_step(5);
             (void) a_def;
             (void) a_flag;
             (void) tc;
             (void) t_flag;
             return;
         }
+        case MSG_ATTACK_DISABLED: {
+            // the attack was negated / disabled before a Damage Step: no battle
+            // is in progress any more, so the board goes back to the phase track
+            g_battle = false;
+            return;
+        }
         case MSG_DAMAGE_STEP_START: {
+            // substep 1 (Start of the Damage Step)
+            set_battle_step(1);
             if (g_current_phase != 0x20) {
                 g_current_phase = 0x20;
                 log_add("— Damage Step —");
@@ -789,22 +1186,39 @@ static void log_game_event(uint8_t type, Msg &msg) {
             return;
         }
         case MSG_DAMAGE_STEP_END: {
+            // back to the Battle Step: no Damage Step substep is running
+            set_battle_step(0);
             if (g_current_phase != 0x10) {
                 g_current_phase = 0x10;
                 log_add("— End of Damage Step —");
             }
+            // The attack is over.  `battle` means "an attack is being
+            // resolved", not "we are in the Battle Phase": the turn player is
+            // back in the Battle Step menu between attacks, where the normal
+            // phase tracker (with Battle active) is the right thing to show.
+            // A later attack declaration sets this again.
+            g_battle = false;
             return;
         }
         case MSG_DAMAGE: {
             uint8_t p = msg.u8();
             uint32_t amt = msg.u32();
             log_action(p, "take", " " + std::to_string(amt) + " damage");
+            // a window for "when you take damage" triggers names the damage
+            g_last_action = LastAction();
+            g_last_action.kind = LastAction::DAMAGE;
+            g_last_action.actor = p;
+            g_last_action.amount = amt;
             return;
         }
         case MSG_RECOVER: {
             uint8_t p = msg.u8();
             uint32_t amt = msg.u32();
             log_action(p, "recover", " " + std::to_string(amt) + " LP");
+            g_last_action = LastAction();
+            g_last_action.kind = LastAction::RECOVER;
+            g_last_action.actor = p;
+            g_last_action.amount = amt;
             return;
         }
         case MSG_DRAW: {
@@ -832,6 +1246,14 @@ static void log_game_event(uint8_t type, Msg &msg) {
                 }
                 log_add_v(v, std::string(log_who_v(v, p)) + " " + (mine ? "draw" : "draws") + " " + what);
             }
+            // a window for "when you draw" triggers names the draw (opening
+            // hands happen before the first prompt and are not that event)
+            if (!opening && n > 0) {
+                g_last_action = LastAction();
+                g_last_action.kind = LastAction::DRAW;
+                g_last_action.actor = p;
+                g_last_action.count = n;
+            }
             return;
         }
         case MSG_NEW_PHASE: {
@@ -842,12 +1264,47 @@ static void log_game_event(uint8_t type, Msg &msg) {
                 // resolved chains no longer hold targets; clear the highlight
                 // so it doesn't linger into the next phase
                 g_field.targets.clear();
+                // a real phase change ends any Damage Step substep; leaving the
+                // Battle Phase for good also ends the battle-step track
+                g_battle_step = 0;
+                if (!phase_is_battle(ph)) g_battle = false;
+                // chain-prompt context: a window at the start of a phase reads
+                // "Start of the <phase>"
+                g_last_action = LastAction();
+                g_last_action.kind = LastAction::PHASE;
+                g_last_action.phase = ph;
+                clear_effect_source();
+            }
+            return;
+        }
+        case MSG_NEW_TURN: {
+            // the battle (if any) belonged to the previous turn
+            g_battle = false;
+            g_battle_step = 0;
+            g_last_action = LastAction();
+            clear_effect_source();
+            return;
+        }
+        case MSG_HINT: {
+            // HINT payload: [u8 htype][u8 player][u64 data].  HINT_EVENT data
+            // 40..44 mark the engine's Damage Step windows; they are also what
+            // pins the substep numbers that have no message of their own.
+            const uint8_t htype = msg.u8();
+            msg.u8();                       // player the hint is for
+            const uint64_t data = msg.u64();
+            if (htype == HINT_EVENT) {
+                if (data == 40) set_battle_step(1);       // Start of the Damage Step
+                else if (data == 41) set_battle_step(3);  // Before Damage Calculation
+                else if (data == 42) set_battle_step(4);  // During Damage Calculation
+                else if (data == 43) set_battle_step(6);  // Resolve Effects
+                else if (data == 44) set_battle_step(7);  // End of the Damage Step
             }
             return;
         }
         case MSG_CHAIN_END: {
             // keep the highlight visible while the chain's effects resolve; it
             // clears when the next phase starts (or the next chain re-targets)
+            clear_effect_source();
             return;
         }
         case MSG_CHAIN_NEGATED:
@@ -882,6 +1339,11 @@ static void log_game_event(uint8_t type, Msg &msg) {
                 res += heads ? "Heads" : "Tails";
             }
             log_action(player, "toss", std::string(" a coin — ") + res);
+            g_last_action = LastAction();
+            g_last_action.kind = LastAction::COIN;
+            g_last_action.actor = player;
+            g_last_action.count = count;
+            g_last_action.results = res;
             return;
         }
         case MSG_TOSS_DICE: {
@@ -893,6 +1355,21 @@ static void log_game_event(uint8_t type, Msg &msg) {
                 res += std::to_string(static_cast<int>(msg.u8()));
             }
             log_action(player, "roll", std::string(count == 1 ? " a die — " : " the dice — ") + res);
+            g_last_action = LastAction();
+            g_last_action.kind = LastAction::DICE;
+            g_last_action.actor = player;
+            g_last_action.count = count;
+            g_last_action.results = res;
+            return;
+        }
+        case MSG_PAY_LPCOST: {
+            // paying LP can trigger "when you pay LP" effects
+            const uint8_t p = msg.u8();
+            const uint32_t amt = msg.u32();
+            g_last_action = LastAction();
+            g_last_action.kind = LastAction::LPCOST;
+            g_last_action.actor = p;
+            g_last_action.amount = amt;
             return;
         }
         case MSG_MISSED_EFFECT: {
@@ -941,6 +1418,107 @@ static std::string card_desc_string(const uint64_t stringid) {
         if (s) return s;
     }
     return "";
+}
+
+// English text for the generic system string ids card scripts pass to
+// Duel.Hint(HINT_SELECTMSG, tp, HINTMSG_*).  The core ships those in Chinese in
+// sim/ygopro/strings.conf, so the ones a card can ask about are translated here;
+// they describe a selection ("Select the card(s) to destroy") and never carry
+// card data.  The three core-generated Yes/No questions are included too.
+static std::string system_string(const uint64_t id) {
+    switch (id) {
+        case 30: return "Continue the attack?";
+        case 31: return "Attack directly?";
+        case 32: return "Enter the second Battle Phase?";
+        case 90: return "Normal Summon without Tributing?";
+        case 500: return "Select the card(s) to release";
+        case 501: return "Select the card(s) to discard";
+        case 502: return "Select the card(s) to destroy";
+        case 503: return "Select the card(s) to banish";
+        case 504: return "Select the card(s) to send to the Graveyard";
+        case 505: return "Select the card(s) to return to the hand";
+        case 506: return "Select the card(s) to add to the hand";
+        case 507: return "Select the card(s) to return to the Deck";
+        case 508: return "Select the monster(s) to Summon";
+        case 509: return "Select the monster(s) to Special Summon";
+        case 510: return "Select the card(s) to Set";
+        case 511: return "Select the Fusion Material Monster(s)";
+        case 512: return "Select the Synchro Material Monster(s)";
+        case 513: return "Select the Xyz Material Monster(s)";
+        case 514: return "Select the face-up card(s)";
+        case 515: return "Select the face-down card(s)";
+        case 516: return "Select the monster(s) in Attack Position";
+        case 517: return "Select the monster(s) in Defense Position";
+        case 518: return "Select the card(s) to equip";
+        case 519: return "Select the material(s) to detach";
+        case 520: return "Select the monster(s) whose control to change";
+        case 521: return "Select the card(s) to destroy and replace";
+        case 522: return "Select the card(s) to change to face-up Attack Position";
+        case 523: return "Select the card(s) to change to face-up Defense Position";
+        case 524: return "Select the card(s) to change to face-down Attack Position";
+        case 525: return "Select the card(s) to change to face-down Defense Position";
+        case 526: return "Select the card(s) to confirm";
+        case 527: return "Select the card(s) to place on the field";
+        case 528: return "Select the monster(s) whose battle position to change";
+        case 529: return "Select your own card(s)";
+        case 530: return "Select your opponent's card(s)";
+        case 531: return "Select the monster(s) to Tribute";
+        case 532: return "Select the material(s) to detach";
+        case 533: return "Select the Link Material Monster(s)";
+        case 549: return "Select the attack target";
+        case 550: return "Select the effect to activate";
+        case 551: return "Select the target card(s)";
+        case 552: return "Call a coin";
+        case 553: return "Roll a die";
+        case 554: return "Select the card type";
+        case 555: return "Select an option";
+        case 556: return "Select the effect to resolve";
+        case 560: return "Select a card";
+        case 561: return "Select a position";
+        case 562: return "Select an Attribute";
+        case 563: return "Select a Type";
+        case 564: return "Declare a card name";
+        case 565: return "Select a number";
+        case 566: return "Select an effect to activate";
+        case 567: return "Select a Level/Rank";
+        case 568: return "Select the card to resolve";
+        case 569: return "Select a zone";
+        case 570: return "Select the zone(s) to disable";
+        case 571: return "Select the zone to move to";
+        case 572: return "Select the counter(s)";
+        case 575: return "Select the effect to negate";
+        case 576: return "Select ATK or DEF";
+        case 577: return "Select the card(s) to apply to";
+        case 578: return "Select the card(s) to attach";
+        case 579: return "Select the card(s) to send to the Graveyard";
+        default: return "";
+    }
+}
+
+// Resolve a question Stringid: card-effect text when it is a card string,
+// otherwise the translated generic system string (HINTMSG_*).  Empty when the
+// script asked no question.
+static std::string question_string(const uint64_t id) {
+    const std::string s = card_desc_string(id);
+    return s.empty() ? system_string(id) : s;
+}
+
+// The question attached to the SELECT being handed to the player (the
+// HINT_SELECTMSG that immediately precedes it), consumed once.
+static std::string take_select_question() {
+    const bool fresh = g_hint_selectmsg_fresh;
+    g_hint_selectmsg_fresh = false;
+    if (!fresh || !g_last_hint_selectmsg) return "";
+    return question_string(g_last_hint_selectmsg);
+}
+
+// Shared trailing fields for non-chain prompts: the question the script asked
+// and the card whose effect is asking.  Empty fields are omitted.
+static std::string prompt_extras_json(const std::string &question) {
+    std::ostringstream out;
+    if (!question.empty()) out << ",\"question\":" << json::str(question);
+    if (!g_effect_source.empty()) out << ",\"source\":" << json::str(g_effect_source);
+    return out.str();
 }
 
 // card option helper: code + name + position for the UI
@@ -1108,6 +1686,14 @@ static void emit_line(const std::string &line) {
     std::fprintf(stdout, "%s\n", line.c_str());
     std::fflush(stdout);
 }
+// One presentation step for the substep bar (no visual of its own).
+static void emit_battle_step_marker(const int step) {
+    std::ostringstream out;
+    out << R"({"ev":"anim","kind":"battle_step","battle":true,"step":)" << step
+        << R"(,"turn":)" << g_turns << "}";
+    emit_line(out.str());
+}
+
 
 static void emit_state() {
     if (g_multiplayer) {
@@ -1213,7 +1799,7 @@ static void anim_game_event(uint8_t type, Msg &msg) {
                     << ",\"tloc\":" << static_cast<int>(target_location)
                     << ",\"tseq\":" << target_sequence
                     << ",\"tpos\":" << target_position
-                    << ",\"turn\":" << g_turns << "}";
+                    << ",\"turn\":" << g_turns << battle_step_json() << "}";
             emit_line(out.str());
             return;
         }
@@ -1223,7 +1809,8 @@ static void anim_game_event(uint8_t type, Msg &msg) {
             std::ostringstream out;
             out << R"({"ev":"anim","kind":"damage")"
                     << ",\"p\":" << static_cast<int>(player)
-                    << ",\"amt\":" << static_cast<int>(amount) << "}";
+                    << ",\"amt\":" << static_cast<int>(amount)
+                    << battle_step_json() << "}";
             emit_line(out.str());
             return;
         }
@@ -1233,7 +1820,8 @@ static void anim_game_event(uint8_t type, Msg &msg) {
             std::ostringstream out;
             out << R"({"ev":"anim","kind":"recover")"
                     << ",\"p\":" << static_cast<int>(player)
-                    << ",\"amt\":" << static_cast<int>(amount) << "}";
+                    << ",\"amt\":" << static_cast<int>(amount)
+                    << battle_step_json() << "}";
             emit_line(out.str());
             return;
         }
@@ -1259,8 +1847,43 @@ static void anim_game_event(uint8_t type, Msg &msg) {
                     << ",\"frompos\":" << static_cast<int>(prev)
                     << ",\"topos\":" << static_cast<int>(cur)
                     << ",\"flipsummon\":false"
-                    << ",\"turn\":" << g_turns << "}";
+                    << ",\"turn\":" << g_turns << battle_step_json() << "}";
             emit_line(out.str());
+            return;
+        }
+        case MSG_MOVE: {
+            // payload: [code u32][prev loc_info][new loc_info][reason u32].
+            // A destroyed card is shown breaking *before* the snapshot diff
+            // flies it to the Graveyard: the movement itself is animated from
+            // the diff, but the destruction has no message of its own.
+            const uint32_t code = msg.u32();
+            const uint8_t pc = msg.u8();
+            const uint8_t pl = msg.u8();
+            const uint32_t ps = msg.u32();
+            msg.u32();                    // previous position
+            const uint8_t nc = msg.u8();
+            const uint8_t nl = msg.u8();
+            msg.u32();                    // new sequence
+            const uint32_t npos = msg.u32();
+            const uint32_t reason = msg.u32();
+            (void) nc;
+            if (nl == 0x10 /* LOCATION_GRAVE */ && code
+                && (pl == 0x04 || pl == 0x08)          /* left the field */
+                && (reason & (0x1 | 0x20))) {           /* DESTROY | BATTLE */
+                std::ostringstream out;
+                const int step = (g_battle && (reason & 0x20)) ? 7 : g_battle_step;
+                out << R"({"ev":"anim","kind":"destroy")"
+                        << ",\"p\":" << static_cast<int>(pc)
+                        << ",\"loc\":" << static_cast<int>(pl)
+                        << ",\"seq\":" << ps
+                        << ",\"code\":" << code
+                        << ",\"name\":" << json::str(card_name_ui(code))
+                        << ",\"topos\":" << npos
+                        << ",\"turn\":" << g_turns
+                        << (g_battle ? ",\"battle\":true,\"step\":" + std::to_string(step) : "")
+                        << "}";
+                emit_line(out.str());
+            }
             return;
         }
         case MSG_CHAINING: {
@@ -1297,7 +1920,7 @@ static void anim_game_event(uint8_t type, Msg &msg) {
                     << ",\"code\":" << code
                     << ",\"ctype\":\"" << ctype << "\""
                     << ",\"chain\":" << link
-                    << ",\"turn\":" << g_turns << "}";
+                    << ",\"turn\":" << g_turns << battle_step_json() << "}";
             emit_line(ao.str());
             // An activation is the one "this card was used" fact the event stream
             // does not otherwise carry: summons, sets and attacks have anim
@@ -1599,9 +2222,16 @@ static void set_response_i(intptr_t duel_handle, int32_t v);
 // message types this file does not know about.
 // ---------------------------------------------------------------------------
 static bool human_yesno(const intptr_t duel_handle, Msg &msg, const char *kind) {
+    msg.u8();                              // player
+    const uint64_t desc = msg.u64();       // the question the script asked
+    // a HINT_SELECTMSG may precede the question; consume it so it cannot leak
+    const std::string hint_q = take_select_question();
+    const std::string asked = question_string(desc);
+    const std::string question = asked.empty() ? hint_q : asked;
     emit_state();
     std::ostringstream out;
-    out << R"({"ev":"prompt","type":")" << kind << R"(","player":)" << static_cast<int>(g_active_prompt_player) << "}";
+    out << R"({"ev":"prompt","type":")" << kind << R"(","player":)" << static_cast<int>(g_active_prompt_player)
+        << prompt_extras_json(question) << "}";
     emit_line(out.str());
     const std::string line = read_action_line();
     const actjson::Val value = actjson::field(line, "value");
@@ -1627,7 +2257,11 @@ static bool human_effectyn(const intptr_t duel_handle, Msg &msg) {
     emit_line(out.str());
     const std::string line = read_action_line();
     const actjson::Val value = actjson::field(line, "value");
-    set_response_i(duel_handle, (value.is_num && value.i != 0) ? 1 : 0);
+    const bool yes = value.is_num && value.i != 0;
+    // an activated trigger asks its own follow-up questions (targets, mode
+    // choices) before the chain link is created; make it the source now
+    if (yes) note_effect_source(code);
+    set_response_i(duel_handle, yes ? 1 : 0);
     return false;
 }
 
@@ -1641,10 +2275,11 @@ static bool human_option(const intptr_t duel_handle, Msg &msg) {
     for (int i = 0; i < n; ++i) opts[i] = msg.u64();
     std::vector<uint32_t> codes(n, 0);
     std::vector<std::string> descs(n);
+    const std::string question = take_select_question();
     emit_state();
     std::ostringstream out;
     out << R"({"ev":"prompt","type":"option","player":)" << static_cast<int>(g_active_prompt_player) << ",\"count\":" << n
-            << ",\"options\":[";
+            << prompt_extras_json(question) << ",\"options\":[";
     for (int i = 0; i < n; ++i) {
         if (i) out << ",";
         // option values are usually effect description Stringids: decode which
@@ -1700,11 +2335,13 @@ static bool human_select_card(const intptr_t duel_handle, Msg &msg, const bool i
         // hide the opponent's face-down field cards (attack targets, backrow)
         opts[i] = card_opt_json_secret(code, pos, ctrl, loc, seq, g_active_prompt_player);
     }
+    const std::string question = take_select_question();
     emit_state();
     std::ostringstream out;
     out << R"({"ev":"prompt","type":")" << (is_tribute ? "tribute" : "card")
             << R"(","player":)" << static_cast<int>(g_active_prompt_player) << ",\"min\":" << min << ",\"max\":" << max
             << ",\"cancelable\":" << (cancelable ? "true" : "false")
+            << prompt_extras_json(question)
             << ",\"cards\":[";
     for (int i = 0; i < n; ++i) {
         if (i) out << ",";
@@ -1770,12 +2407,13 @@ static bool human_sum(intptr_t duel_handle, Msg &msg) {
                 << ",\"seq\":" << seq << ",\"level\":" << lv << "}";
         opts[i] = out.str();
     }
+    const std::string question = take_select_question();
     emit_state();
     std::ostringstream out;
     out << R"({"ev":"prompt","type":"sum","player":)" << static_cast<int>(g_active_prompt_player)
             << ",\"acc\":" << (acc - must_sum)
             << ",\"min\":" << min << ",\"max\":" << max
-            << ",\"mode\":" << mode << ",\"cards\":[";
+            << ",\"mode\":" << mode << prompt_extras_json(question) << ",\"cards\":[";
     for (int i = 0; i < n; ++i) {
         if (i) out << ",";
         out << opts[i];
@@ -1803,6 +2441,7 @@ static bool human_chain(const intptr_t duel_handle, Msg &msg) {
     msg.skip(8);
     const int n = static_cast<int>(msg.u32());
     std::vector<std::string> opts(n);
+    std::vector<uint32_t> opt_codes(n, 0);
     for (int i = 0; i < n; ++i) {
         const uint32_t code = msg.u32();
         const uint8_t ctrl = msg.u8();
@@ -1812,6 +2451,7 @@ static bool human_chain(const intptr_t duel_handle, Msg &msg) {
         const uint64_t desc = msg.u64();
         msg.u8();                       // client_mode
         const uint8_t trig = msg.u8();  // effect type: optional/mandatory trigger
+        opt_codes[i] = code;
         opts[i] = effect_opt_json(code, ctrl, loc, seq, desc, g_active_prompt_player, trig != 0);
     }
     emit_state();
@@ -1824,10 +2464,19 @@ static bool human_chain(const intptr_t duel_handle, Msg &msg) {
     // prompt after the action reports it, later ones in the same phase do not.
     const bool acted = g_recent_action && !g_action_reported[me < 2 ? me : 0];
     if (me < 2) g_action_reported[me] = true;
+    // action_text: the action that immediately preceded this window, phrased for
+    // the prompted player.  A chain window after an answered idle/battle command
+    // with no message in between (the pending flag is cleared by any message
+    // except SELECT_CHAIN/RETRY/HINT) is the phase-leave window: the turn player
+    // chose to move on, so the phase-leave wording wins over any older action.
+    const std::string action_text = g_phase_command_pending
+                                        ? phase_leave_text(me, g_turn_player, g_current_phase)
+                                        : last_action_text(me);
     out << R"({"ev":"prompt","type":"chain","player":)" << static_cast<int>(me) << ",\"forced\":"
             << (forced ? "true" : "false")
             << ",\"chain\":" << g_chain_size
-            << ",\"action\":" << (acted ? "true" : "false") << ",\"options\":[";
+            << ",\"action\":" << (acted ? "true" : "false")
+            << ",\"action_text\":" << json::str(action_text) << ",\"options\":[";
     for (int i = 0; i < n; ++i) {
         if (i) out << ",";
         out << opts[i];
@@ -1847,6 +2496,9 @@ static bool human_chain(const intptr_t duel_handle, Msg &msg) {
     const actjson::Val iv = actjson::field(line, "index");
     int idx = static_cast<int>(iv.is_num ? iv.i : -1);
     if (idx < 0 || idx >= n) idx = -1;
+    // chaining with a card makes it the effect whose follow-up questions
+    // (targets, modes) are about to be asked
+    if (idx >= 0) note_effect_source(opt_codes[idx]);
     set_response_i(duel_handle, idx);
     return false;
 }
@@ -1865,7 +2517,7 @@ static bool human_position(const intptr_t duel_handle, Msg &msg) {
     out << R"({"ev":"prompt","type":"position","player":)" << static_cast<int>(g_active_prompt_player)
         << ",\"code\":" << code
         << ",\"name\":" << json::str(code ? card_name_ui(code) : "")
-        << ",\"positions\":" << positions << "}";
+        << ",\"positions\":" << positions << prompt_extras_json("") << "}";
     emit_line(out.str());
     const std::string line = read_action_line();
     const actjson::Val value = actjson::field(line, "pos");
@@ -1881,10 +2533,11 @@ static bool human_place(const intptr_t duel_handle, Msg &msg) {
     const int player = msg.u8();
     const int count = msg.u8();
     const uint32_t flag = msg.u32();
+    const std::string question = take_select_question();
     emit_state();
     std::ostringstream out;
     out << R"({"ev":"prompt","type":"place","player":)" << static_cast<int>(g_active_prompt_player) << ",\"count\":" << count
-            << ",\"flag\":" << flag << "}";
+            << ",\"flag\":" << flag << prompt_extras_json(question) << "}";
     emit_line(out.str());
     const std::string line = read_action_line();
     const auto zs = actjson::zones(line);
@@ -1931,6 +2584,7 @@ static bool human_place(const intptr_t duel_handle, Msg &msg) {
 // two different piles.
 static bool human_idlecmd(intptr_t duel_handle, Msg &msg) {
     msg.u8();
+    clear_effect_source();   // a phase menu is not part of an effect's resolution
     auto group = [&msg]() {
         const int n = static_cast<int>(msg.u32());
         std::vector<std::string> opts(n);
@@ -1964,6 +2618,7 @@ static bool human_idlecmd(intptr_t duel_handle, Msg &msg) {
     // so it is parsed separately from the plain code groups above
     int n_act = static_cast<int>(msg.u32());
     std::vector<std::string> act_opts(n_act);
+    std::vector<uint32_t> act_codes(n_act, 0);
     for (int i = 0; i < n_act; ++i) {
         uint32_t code = msg.u32();
         uint8_t ctrl = msg.u8();
@@ -1971,6 +2626,7 @@ static bool human_idlecmd(intptr_t duel_handle, Msg &msg) {
         uint32_t seq = msg.u32();
         uint64_t desc = msg.u64();
         msg.u8();
+        act_codes[i] = code;
         act_opts[i] = effect_opt_json(code, ctrl, loc, seq, desc, g_active_prompt_player);
     }
     int to_bp = msg.u8(), to_ep = msg.u8(), can_shuffle = msg.u8();
@@ -2028,6 +2684,7 @@ static bool human_idlecmd(intptr_t duel_handle, Msg &msg) {
     } else if (kind == "act") {
         t = 5;
         s = idx;
+        if (idx >= 0 && idx < n_act) note_effect_source(act_codes[idx]);
     } else if (kind == "to_bp") { t = 6; } else if (kind == "to_ep") { t = 7; } else if (kind == "shuffle") { t = 8; }
     set_response_i(duel_handle, t | (s << 16));
     return false;
@@ -2037,8 +2694,10 @@ static bool human_idlecmd(intptr_t duel_handle, Msg &msg) {
 // activate a quick effect, or move to Main Phase 2 / End Phase.
 static bool human_battlecmd(intptr_t duel_handle, Msg &msg) {
     msg.u8();
+    clear_effect_source();   // the battle menu is not an effect's resolution
     int act = static_cast<int>(msg.u32());
     std::vector<std::string> act_opts(act);
+    std::vector<uint32_t> act_codes(act, 0);
     for (int i = 0; i < act; ++i) {
         uint32_t code = msg.u32();
         uint8_t ctrl = msg.u8();
@@ -2046,6 +2705,7 @@ static bool human_battlecmd(intptr_t duel_handle, Msg &msg) {
         uint32_t seq = msg.u32();
         uint64_t desc = msg.u64();
         msg.u8();
+        act_codes[i] = code;
         act_opts[i] = effect_opt_json(code, ctrl, loc, seq, desc, g_active_prompt_player);
     }
     int atk = static_cast<int>(msg.u32());
@@ -2088,6 +2748,7 @@ static bool human_battlecmd(intptr_t duel_handle, Msg &msg) {
     if (kind == "act") {
         t = 0;
         s = idx;
+        if (idx >= 0 && idx < act) note_effect_source(act_codes[idx]);
     } else if (kind == "attack") {
         t = 1;
         s = idx;
@@ -2136,12 +2797,14 @@ static bool human_unselect_card(intptr_t duel_handle, Msg &msg) {
         uint32_t pos = msg.u32();
         unsel[i] = card_opt_json_secret(code, pos, ctrl, loc, seq, g_active_prompt_player);
     }
+    const std::string question = take_select_question();
     emit_state();
     std::ostringstream out;
     out << R"({"ev":"prompt","type":"unselect","player":)" << static_cast<int>(g_active_prompt_player) << ""
             << ",\"min\":" << min << ",\"max\":" << max
             << ",\"finishable\":" << (finishable ? "true" : "false")
             << ",\"cancelable\":" << (cancelable ? "true" : "false")
+            << prompt_extras_json(question)
             << ",\"select\":[";
     for (size_t i = 0; i < sel.size(); ++i) out << (i ? "," : "") << sel[i];
     out << "],\"unselect\":[";
@@ -2178,6 +2841,7 @@ static bool human_announce_number(const intptr_t duel_handle, Msg &msg) {
     const int n = msg.u8();
     std::vector<uint64_t> opts(static_cast<size_t>(n));
     for (int i = 0; i < n; ++i) opts[static_cast<size_t>(i)] = msg.u64();
+    const std::string question = take_select_question();
     emit_state();
     std::ostringstream out;
     out << "{\"ev\":\"prompt\",\"type\":\"number\",\"player\":" << static_cast<int>(g_active_prompt_player)
@@ -2186,7 +2850,7 @@ static bool human_announce_number(const intptr_t duel_handle, Msg &msg) {
         if (i) out << ",";
         out << opts[static_cast<size_t>(i)];
     }
-    out << "],\"desc\":" << json::str(card_desc_string(g_last_hint_selectmsg)) << "}";
+    out << "],\"desc\":" << json::str(question) << prompt_extras_json(question) << "}";
     emit_line(out.str());
     const std::string line = read_action_line();
     const actjson::Val value = actjson::field(line, "index");
@@ -2220,10 +2884,11 @@ static bool human_announce_race(const intptr_t duel_handle, Msg &msg) {
     msg.u8();                    // player
     const int count = msg.u8();
     const uint64_t available = msg.u64();
+    const std::string question = take_select_question();
     emit_state();
     std::ostringstream out;
     out << R"({"ev":"prompt","type":"race","player":)" << static_cast<int>(g_active_prompt_player)
-        << ",\"count\":" << count << ",\"options\":[";
+        << ",\"count\":" << count << prompt_extras_json(question) << ",\"options\":[";
     bool first = true;
     for (int b = 0; b < 64; ++b) {
         const uint64_t bit = 1ull << b;
@@ -2259,10 +2924,11 @@ static bool human_announce_attrib(const intptr_t duel_handle, Msg &msg) {
     msg.u8();                    // player
     const int count = msg.u8();
     const uint32_t available = msg.u32();
+    const std::string question = take_select_question();
     emit_state();
     std::ostringstream out;
     out << R"({"ev":"prompt","type":"attrib","player":)" << static_cast<int>(g_active_prompt_player)
-        << ",\"count\":" << count << ",\"options\":[";
+        << ",\"count\":" << count << prompt_extras_json(question) << ",\"options\":[";
     bool first = true;
     for (int b = 0; b < 32; ++b) {
         const uint32_t bit = 1u << b;
@@ -2309,10 +2975,12 @@ static bool human_select_counter(const intptr_t duel_handle, Msg &msg) {
         cards[i].seq = msg.u8();
         cards[i].held = msg.u16();
     }
+    const std::string question = take_select_question();
     emit_state();
     std::ostringstream out;
     out << R"({"ev":"prompt","type":"counter","player":)" << static_cast<int>(g_active_prompt_player)
-        << ",\"count\":" << count << ",\"counterType\":" << counter_type << ",\"cards\":[";
+        << ",\"count\":" << count << ",\"counterType\":" << counter_type
+        << prompt_extras_json(question) << ",\"cards\":[";
     for (uint32_t i = 0; i < n; ++i) {
         if (i) out << ",";
         out << "{\"code\":" << cards[i].code
@@ -2366,10 +3034,11 @@ static bool human_announce_card(const intptr_t duel_handle, Msg &msg) {
     const int n = msg.u8();
     std::vector<uint64_t> opts(static_cast<size_t>(n));
     for (int i = 0; i < n; ++i) opts[static_cast<size_t>(i)] = msg.u64();
+    const std::string question = take_select_question();
     emit_state();
     std::ostringstream out;
     out << "{\"ev\":\"prompt\",\"type\":\"announce_card\",\"player\":" << static_cast<int>(g_active_prompt_player)
-      << ",\"count\":" << n << ",\"options\":[";
+      << ",\"count\":" << n << prompt_extras_json(question) << ",\"options\":[";
     for (int i = 0; i < n; ++i) {
         if (i) out << ",";
         out << opts[static_cast<size_t>(i)];
