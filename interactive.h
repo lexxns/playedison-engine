@@ -1572,7 +1572,8 @@ static std::string card_opt_json_secret(const uint32_t code, const uint32_t pos,
 // description, so the UI should not label it "effect N".
 static std::string effect_opt_json(const uint32_t code, const uint8_t ctrl, const uint8_t loc,
                                    const uint32_t seq, const uint64_t desc, const uint8_t viewer,
-                                   const bool is_trigger = false) {
+                                   const bool is_trigger = false,
+                                   const bool mandatory = false) {
     const uint32_t effect = (desc && desc > 0x7ff) ? static_cast<uint32_t>((desc & 0xfffff) + 1) : 0;
     const std::string dtext = card_desc_string(desc);
     // no card description: fall back to naming the trigger window so the player
@@ -1590,6 +1591,10 @@ static std::string effect_opt_json(const uint32_t code, const uint8_t ctrl, cons
             // effect the player may activate right now.  The client must never
             // auto-pass a window that offers one.
             << ",\"trig\":" << (is_trigger ? "true" : "false")
+            // the engine requires this activation (a mandatory trigger, a forced
+            // quick effect, or a continuous effect that forces the window): the
+            // client marks that option so "which effect must I pick?" is visible
+            << ",\"mandatory\":" << (mandatory ? "true" : "false")
             << ",\"trigger\":" << json::str(trigger)
             << ",\"desc\":" << json::str(dtext) << "}";
     return out.str();
@@ -2450,9 +2455,15 @@ static bool human_chain(const intptr_t duel_handle, Msg &msg) {
         msg.u32();
         const uint64_t desc = msg.u64();
         msg.u8();                       // client_mode
-        const uint8_t trig = msg.u8();  // effect type: optional/mandatory trigger
+        // engine flags: bit 0 = trigger effect, bit 1 = the engine requires
+        // this option (mandatory trigger / forced quick effect / continuous
+        // effect that forces the window)
+        const uint8_t opt_flags = msg.u8();
+        const bool is_trigger = (opt_flags & 1) != 0;
+        const bool mandatory = (opt_flags & 2) != 0;
         opt_codes[i] = code;
-        opts[i] = effect_opt_json(code, ctrl, loc, seq, desc, g_active_prompt_player, trig != 0);
+        opts[i] = effect_opt_json(code, ctrl, loc, seq, desc, g_active_prompt_player,
+                                  is_trigger, mandatory);
     }
     emit_state();
     std::ostringstream out;
@@ -2484,18 +2495,17 @@ static bool human_chain(const intptr_t duel_handle, Msg &msg) {
     out << "]}";
     emit_line(out.str());
     const std::string line = read_action_line();
-    if (forced) {
-        set_response_i(duel_handle, 0);
-        return false;
-    }
-    const actjson::Val pv = actjson::field(line, "pass");
-    if (pv.is_true) {
-        set_response_i(duel_handle, -1);
-        return false;
-    }
+    // A forced window still asks *which* mandatory effect to activate
+    // the player chooses the SEGOC order), so the selected index must be honoured.
+    // A malformed answer in a forced window falls back to the first option instead of
+    // deadlocking the duel; a non-forced one falls back to passing.
     const actjson::Val iv = actjson::field(line, "index");
     int idx = static_cast<int>(iv.is_num ? iv.i : -1);
-    if (idx < 0 || idx >= n) idx = -1;
+    if (idx < 0 || idx >= n) idx = forced ? (n > 0 ? 0 : -1) : -1;
+    if (!forced) {
+        const actjson::Val pv = actjson::field(line, "pass");
+        if (pv.is_true) idx = -1;
+    }
     // chaining with a card makes it the effect whose follow-up questions
     // (targets, modes) are about to be asked
     if (idx >= 0) note_effect_source(opt_codes[idx]);

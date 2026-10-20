@@ -323,6 +323,7 @@ bool field::process(Processors::PhaseEvent& arg) {
 				continue;
 			peffect->id = infos.field_id++;
 			core.select_chains.emplace_back().triggering_effect = peffect;
+			core.select_chains.back().mandatory = true;
 			++tf_count;
 		}
 		pr = effects.continuous_effect.equal_range(phase_event);
@@ -334,6 +335,7 @@ bool field::process(Processors::PhaseEvent& arg) {
 				continue;
 			peffect->id = infos.field_id++;
 			core.select_chains.emplace_back().triggering_effect = peffect;
+			core.select_chains.back().mandatory = true;   // continuous effect that forces the window
 			++cn_count;
 		}
 		//all effects taking control non-permanently are only until End Phase, not until Turn end
@@ -354,6 +356,7 @@ bool field::process(Processors::PhaseEvent& arg) {
 			if(peffect->get_value(phandler) != phandler->current.controler)
 				continue;
 			core.select_chains.emplace_back().triggering_effect = peffect;
+			core.select_chains.back().mandatory = true;   // continuous effect that forces the window
 			++cn_count;
 		}
 		core.spe_effect[check_player] = 0;
@@ -635,8 +638,10 @@ bool field::process(Processors::PointEvent& arg) {
 			   && check_trigger_effect(*clit)
 			   && peffect->is_chainable(tp)
 			   && peffect->is_activateable(tp, clit->evt, TRUE, FALSE, FALSE, is_flag(DUEL_TRIGGER_WHEN_PRIVATE_KNOWLEDGE), is_flag(DUEL_TRIGGER_WHEN_PRIVATE_KNOWLEDGE))) {
-				if(tp == core.current_player)
+				if(tp == core.current_player) {
 					core.select_chains.push_back(*clit);
+					core.select_chains.back().mandatory = true;   // forced-trigger SEGOC
+				}
 			} else {
 				peffect->active_type = 0;
 				core.new_fchain_s.erase(clit++);
@@ -964,8 +969,10 @@ bool field::process(Processors::QuickEffect& arg) {
 			card* phandler = peffect->get_handler();
 			if(peffect->is_chainable(ifit->second.triggering_player) && peffect->check_count_limit(ifit->second.triggering_player)
 					&& phandler->is_has_relation(ifit->second)) {
-				if(ifit->second.triggering_player == check_player)
+				if(ifit->second.triggering_player == check_player) {
 					core.select_chains.push_back(ifit->second);
+					core.select_chains.back().mandatory = true;   // forced quick effect (QUICK_F)
+				}
 			} else {
 				core.quick_f_chain.erase(ifit++);
 				continue;

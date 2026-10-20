@@ -60,6 +60,9 @@ struct chain {
 	uint8_t triggering_summon_location{};
 	bool triggering_summon_proc_complete{}; //properly summoned or not
 	bool was_just_sent{ false };
+	// the engine requires this chain option (a mandatory trigger / forced quick
+	// effect / continuous effect that must activate); the client marks it
+	bool mandatory{ false };
 	uint16_t chain_id;
 	uint16_t triggering_location;
 	uint32_t triggering_sequence;

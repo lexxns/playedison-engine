@@ -494,7 +494,16 @@ bool field::process(Processors::SelectChain& arg) {
 			// effect), so the client must never auto-pass its window silently.
 			// One trailing byte per chain link; a reader that does not want it
 			// simply does not read it (each message has its own cursor).
-			message->write<uint8_t>((peffect->type & (EFFECT_TYPE_TRIGGER_O | EFFECT_TYPE_TRIGGER_F)) ? 1 : 0);
+			//   bit 0: this option is a trigger effect (TRIGGER_O / TRIGGER_F)
+			//   bit 1: the engine requires this option (mandatory trigger,
+			//          forced quick effect, or a continuous effect forcing the
+			//          window) — the client marks it as a mandatory activation
+			uint8_t opt_flags = 0;
+			if(peffect->type & (EFFECT_TYPE_TRIGGER_O | EFFECT_TYPE_TRIGGER_F))
+				opt_flags |= 1;
+			if(ch.mandatory)
+				opt_flags |= 2;
+			message->write<uint8_t>(opt_flags);
 		}
 		return FALSE;
 	} else {
