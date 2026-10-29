@@ -61,7 +61,11 @@ function c39910367.rop(e,tp,eg,ep,ev,re,r,rp)
 	e:GetHandler():RemoveCounter(ep,0x3001,ev,REASON_EFFECT)
 end
 function c39910367.desreptg(e,tp,eg,ep,ev,re,r,rp,chk)
-	if chk==0 then return e:GetHandler():GetCounter(0x3001)>0 end
+	-- Ruling: the replacement only applies when this card would be destroyed by
+	-- a *card effect*.  Activating a new Field Spell replaces the current one by
+	-- game rule, so the Citadel must go to the GY there — otherwise both Field
+	-- Spells would stay active.
+	if chk==0 then return e:GetHandler():GetCounter(0x3001)>0 and bit.band(r,REASON_EFFECT)~=0 end
 	return Duel.SelectYesNo(tp,aux.Stringid(39910367,1))
 end
 function c39910367.desrepop(e,tp,eg,ep,ev,re,r,rp)
