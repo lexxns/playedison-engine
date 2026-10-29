@@ -1550,7 +1550,8 @@ static std::string loc_name(const uint8_t loc, const uint8_t ctrl, const uint8_t
 // Non-field cards (hand/grave/extra) are left as-is — their visibility is
 // decided by the effect that put them into the selection.
 static std::string card_opt_json_secret(const uint32_t code, const uint32_t pos, const uint8_t ctrl,
-                                        const uint8_t loc, const uint32_t seq, const uint8_t viewer) {
+                                        const uint8_t loc, const uint32_t seq, const uint8_t viewer,
+                                        const int release = 0) {
     const bool on_field = (loc == 0x04 || loc == 0x08); // LOCATION_MZONE / SZONE
     const bool faceup = (pos & 0x5) != 0; // POS_FACEUP_ATTACK | POS_FACEUP_DEFENSE
     const bool hidden = (ctrl != viewer && on_field && !faceup);
@@ -1562,7 +1563,12 @@ static std::string card_opt_json_secret(const uint32_t code, const uint32_t pos,
             << ",\"loc\":" << static_cast<int>(loc)
             << ",\"locname\":" << json::str(loc_name(loc, ctrl, viewer))
             << ",\"seq\":" << seq
-            << ",\"hidden\":" << (hidden ? "true" : "false") << "}";
+            << ",\"hidden\":" << (hidden ? "true" : "false");
+    // MSG_SELECT_TRIBUTE's release_param: 2 for a monster treated as two
+    // Tributes (Totem Dragon).  The client counts Tributes, not cards, when it
+    // enables the confirm button.
+    if (release > 0) out << ",\"release\":" << release;
+    out << "}";
     return out.str();
 }
 
@@ -2320,6 +2326,7 @@ static bool human_select_card(const intptr_t duel_handle, Msg &msg, const bool i
     const int max = static_cast<int>(msg.u32());
     const int n = static_cast<int>(msg.u32());
     std::vector<std::string> opts(n);
+    std::vector<int> release(n, 1);   // Tributes each card counts as
     for (int i = 0; i < n; ++i) {
         const uint32_t code = msg.u32();
         const uint8_t ctrl = msg.u8();
@@ -2327,10 +2334,11 @@ static bool human_select_card(const intptr_t duel_handle, Msg &msg, const bool i
         uint32_t seq = msg.u32();
         uint32_t pos;
         if (is_tribute) {
-            // MSG_SELECT_TRIBUTE has release_param (1 byte) and NO position.
-            // Recover the position from the field model (tribute targets are
-            // on-field monsters).
-            msg.u8(); // release_param
+            // MSG_SELECT_TRIBUTE has release_param (1 byte, 2 for Totem Dragon
+            // style double Tributes) and NO position.  Recover the position
+            // from the field model (tribute targets are on-field monsters).
+            const uint8_t rp = msg.u8(); // release_param
+            release[i] = rp > 0 ? static_cast<int>(rp) : 1;
             pos = 0x1; // default face-up attack
             auto it = g_field.zone[ctrl].find({loc, seq});
             if (it != g_field.zone[ctrl].end()) pos = it->second.pos;
@@ -2338,7 +2346,8 @@ static bool human_select_card(const intptr_t duel_handle, Msg &msg, const bool i
             pos = msg.u32();
         }
         // hide the opponent's face-down field cards (attack targets, backrow)
-        opts[i] = card_opt_json_secret(code, pos, ctrl, loc, seq, g_active_prompt_player);
+        opts[i] = card_opt_json_secret(code, pos, ctrl, loc, seq, g_active_prompt_player,
+                                       is_tribute ? release[i] : 0);
     }
     const std::string question = take_select_question();
     emit_state();
@@ -2356,12 +2365,35 @@ static bool human_select_card(const intptr_t duel_handle, Msg &msg, const bool i
     emit_line(out.str());
     const std::string line = read_action_line();
     const actjson::Val cv = actjson::field(line, "cancel");
-    if (cv.is_true && cancelable && min == 0) {
+    // The engine's `cancelable` flag is authoritative: a Tribute Summon can
+    // offer Cancel with min > 0, and choosing it must actually back out instead
+    // of falling through to an empty selection that the duel retries forever.
+    if (cv.is_true && cancelable) {
         set_response_i(duel_handle, -1);
         return false;
     }
     std::vector<int> idx = actjson::indices(line);
-    if (idx.size() < static_cast<size_t>(min)) idx.clear(); // invalid -> cancel if allowed
+    bool invalid = false;
+    if (is_tribute) {
+        // `min` is the Tribute total, not the number of cards: one Totem Dragon
+        // (release 2) satisfies a two-Tribute summon on its own.
+        int total = 0;
+        bool known = true;
+        for (int i : idx) {
+            if (i < 0 || i >= n) { known = false; break; }
+            total += release[i];
+        }
+        invalid = !known || total < min || static_cast<int>(idx.size()) > max;
+    } else {
+        invalid = idx.size() < static_cast<size_t>(min);
+    }
+    if (invalid) {
+        if (cancelable) {
+            set_response_i(duel_handle, -1);
+            return false;
+        }
+        idx.clear();
+    }
     std::vector<uint8_t> b(8 + idx.size());
     constexpr int32_t t = 2;
     std::memcpy(b.data(), &t, 4);
